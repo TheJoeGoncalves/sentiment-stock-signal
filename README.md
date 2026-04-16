@@ -2,7 +2,7 @@
 
 A Jupyter Notebook pipeline that fetches financial news headlines, scores them with multiple sentiment models, and trains XGBoost classifiers to predict short-term stock price direction.
 
-The default configuration targets any stock (**NVIDIA (NVDA)** by default) over a time period (April 2024 – April 2026 by default), the ticker, date range, and model toggles are all controlled by a single configuration cell at the top of the notebook.
+The pipeline targets any stock (**NVIDIA (NVDA)** by default) over a time period (April 2024 – April 2026 by default), the ticker, date range, and model toggles are all controlled by a single configuration cell at the top of the notebook.
 
 Currently fixing compatibility with thinking models
 
