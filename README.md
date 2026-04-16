@@ -4,6 +4,8 @@ A Jupyter Notebook pipeline that fetches financial news headlines, scores them w
 
 The default configuration targets **NVIDIA (NVDA)** over the period April 2024 – April 2026, but the ticker, date range, and model toggles are all controlled by a single configuration cell at the top of the notebook.
 
+Currently fixing compatibility with thinking models
+
 ---
 
 ## How It Works
