@@ -1,10 +1,12 @@
-# StockNewsSentiment
+# StockNewsSentiment V.01
 
 A Jupyter Notebook pipeline that fetches financial news headlines, scores them with multiple sentiment models, and trains XGBoost classifiers to predict short-term stock price direction.
 
-The pipeline targets any stock (**NVIDIA (NVDA)** by default) over a time period (April 2024 – April 2026 by default), the ticker, date range, and model toggles are all controlled by a single configuration cell at the top of the notebook.
+The pipeline targets any stock (**NVIDIA (NVDA)** by default) over a configurable time period. The ticker, date range, and model toggles are all controlled by a single configuration cell at the top of the notebook.
 
-Currently fixing compatibility with thinking models
+
+**Goal** — The aim is not to build a perfect, or even accurate, price predictor, but to compare some consistent signal results across sentiment models and time periods when possible. It is an evaluation of each sentiment model's ability to create signal from news, comparing old and new models, small and slightly larger models.
+
 
 ---
 
@@ -14,28 +16,33 @@ The pipeline runs end-to-end in a single notebook with the following stages:
 
 **1. Data ingestion** — Headlines are pulled from the [GDELT Project](https://www.gdeltproject.org/) via Google BigQuery, one partition per day. Each day's results are cached to a local Parquet checkpoint so the notebook can resume after interruptions. Only headlines that match the configured keyword list (e.g. `["NVIDIA", "NVDA"]`) are kept.
 
-**2. Sentiment scoring** — Each headline is scored by up to four models, independently toggled via boolean flags:
+**2. Sentiment scoring** — Each headline is scored by up to four model types, independently toggled via boolean flags:
 
 | Flag | Model | Notes |
 |---|---|---|
 | `RUN_FINBERT` | [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert) | Finance-tuned BERT; outputs negative / neutral / positive |
 | `RUN_VADER` | VADER (`nltk`) | Lexicon-based; fast, no GPU required |
 | `RUN_V2TONE` | GDELT V2Tone | Pre-computed tone score from the GDELT record itself |
-| `RUN_GEMMA` | GEMMA 3 & 4 (4B) or any Ollama-served model | LLM-based scoring; defaults to Gemma 3 4B & Gemma 4 E4B, but any model available in Ollama can be substituted |
+| `RUN_OLLAMA` | Any Ollama-served LLM | Defaults to Gemma 3 4B and 12B; any Ollama model can be substituted |
 
-The `LLM_MODELS` list accepts any model ID recognised by your local Ollama installation — swap in `llama3`, `mistral`, `phi3`, `qwen2`, or any other model and it will be pulled automatically if not already present. You can run a single LLM or several in parallel; each gets its own score column and its own downstream XGBoost classifier.
+The `LLM_MODELS` list accepts any model ID recognised by your local Ollama installation. Each LLM gets its own score column and its own downstream XGBoost classifier.
 
-**3. Feature engineering** — Daily headline scores are aggregated into per-model feature sets (rolling average, standard deviation, momentum at 5- and 10-day windows, shock, volume, surprise, acceleration, extreme-score count, flip count). These are joined with price-derived features (RSI, 5- and 20-day momentum, MA-20, MA-50, volume change, 20-day volatility, VIX) fetched from Yahoo Finance.
+**3. Feature engineering** — Daily headline scores are aggregated into per-model feature sets (rolling average, standard deviation, momentum at 5- and 10-day windows, shock, volume, acceleration, extreme-score flag, flip flag). These are joined with price and market features fetched from Yahoo Finance including RSI, price momentum, volatility, VIX, and S&P 500 return.
 
-**4. Binary target** — The target label is whether the stock's *n*-day forward return is positive (`TARGET_HORIZON_DAYS = 1`, next day, by default).
+**4. Binary target** — The target label is whether the stock's *n*-day forward return is positive (`TARGET_HORIZON_DAYS = 1` by default). Target is computed in trading-day space so horizon=N always means N real market sessions regardless of weekends or holidays. Weekend sentiment rows correctly inherit the next available trading day's target.
 
-**5. Model training** — A separate XGBoost classifier (`XGBClassifier`) is trained for each sentiment model using a grid search over hyperparameters. An optional dead zone filters out predictions near the decision boundary before evaluation.
+**5. Model training** — A separate XGBoost classifier is trained for each sentiment model using grid search over hyperparameters on a static train/val split. Walk-forward validation then runs using the best found params to produce an honest out-of-sample performance estimate across rolling time windows. Val metrics are used for param selection only — walk-forward AUC is the primary performance metric.
 
-**6. Evaluation & diagnostics** — Each trained model is evaluated on held-out validation and test splits. A 4-panel diagnostic grid is produced per model: confusion matrix, ROC curve, probability distribution, and feature importance. Holdout metrics (accuracy, precision, recall, F1) are printed in a summary table.
+**6. Evaluation & diagnostics** — Three separate diagnostic figures are produced per run:
+- **Validation** (blue) — confusion matrix, ROC curve, zoomed probability distribution, feature importance
+- **Walk-forward** (green) — same panels averaged across all rolling folds
+- **Holdout** (orange) — final evaluation on untouched test data, only looked at once
 
-**7. Trading simulation** — Predictions are converted into a simplified long / short / long–short strategy. Cumulative returns for each strategy and for the raw market are plotted side-by-side.
+A model comparison table prints validation vs walk-forward metrics side by side for every sentiment model.
 
-**8. Session backup** — All DataFrames and trained models are serialised to Parquet and Joblib files in a timestamped backup directory. A plain-text model summary is written alongside. Sessions can be restored from any backup directory.
+**7. Trading simulation** — Predictions are converted into long / short / long-short strategies using fresh yfinance data to guarantee only real trading days are used. Returns are shifted by one day so today's signal earns tomorrow's return. A flipped-signal skill check is included to distinguish genuine model skill from market drift.
+
+**8. Session backup** — All DataFrames and trained models are serialised to Parquet and Joblib files in a timestamped backup directory. Sessions can be restored from any backup directory.
 
 ---
 
@@ -54,12 +61,13 @@ seaborn
 scikit-learn
 xgboost
 torch
-transformers          # for FinBERT
-nltk                  # for VADER
+transformers
+nltk
 vaderSentiment
 yfinance
 google-cloud-bigquery
 tqdm
+python-dotenv
 ```
 
 ### External services
@@ -67,14 +75,16 @@ tqdm
 | Service | Purpose |
 |---|---|
 | **Google Cloud / BigQuery** | GDELT headline retrieval |
-| **Ollama** (local, `http://127.0.0.1:11434`) | Serving Gemma 3 and Gemma 4 LLMs |
-| **Yahoo Finance** | Price and VIX data (via `yfinance`) |
+| **Ollama** (local, `http://127.0.0.1:11434`) | Serving local LLMs for sentiment scoring |
+| **Yahoo Finance** | Price, VIX, and S&P 500 data via `yfinance` |
 
 ### Environment variables
 
+Create a `.env` file in the project root (see `.env.example`):
+
 ```
-GCP_CREDENTIALS_PATH   # path to your GCP service-account JSON key
-GCP_PROJECT_ID         # your Google Cloud project ID
+GCP_CREDENTIALS_PATH=path/to/your/service-account.json
+GCP_PROJECT_ID=your-gcp-project-id
 ```
 
 ---
@@ -87,220 +97,208 @@ All user-facing settings live in the first notebook cell:
 # ── Target stock ──────────────────────────────────────────────────────────────
 TICKER       = "NVDA"
 COMPANY_NAME = "NVIDIA"
-KEYWORDS     = ["NVIDIA", "NVDA"]   # used for GDELT regex and headline filtering
+KEYWORDS     = ["NVIDIA", "NVDA"]
 
 # ── Date range ────────────────────────────────────────────────────────────────
-DATE_FROM = "2024-04-12"
+DATE_FROM = "2025-04-15"
 DATE_TO   = "2026-04-15"
 
 # ── Sentiment model toggles ───────────────────────────────────────────────────
 RUN_FINBERT = True
 RUN_VADER   = True
 RUN_V2TONE  = True
-RUN_GEMMA   = True
+RUN_OLLAMA  = True
 
 # ── Ollama / LLM ─────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
-# Add, remove, or swap any Ollama-compatible model.
-# Format: (name, ollama_model_id)
-# "name" becomes the score column prefix, e.g. "gemma3" -> "gemma3_score"
 LLM_MODELS = [
-    ("gemma3", "gemma3:4b"),
-    ("gemma4", "gemma4:e4b"),
-    # ("llama3",  "llama3.1:8b"),
-    # ("mistral", "mistral:7b"),
-    # ("phi3",    "phi3:mini"),
-    # ("qwen",    "qwen2.5:7b"),
+    ("gemma3_4",  "gemma3:4b"),
+    ("gemma3_12", "gemma3:12b"),
+    # ("llama3",   "llama3.1:8b"),
+    # ("mistral",  "mistral:7b"),
+    # ("qwen",     "qwen2.5:7b"),
 ]
 
-SIM_MODEL = "gemma4"
-
-# ── BigQuery ──────────────────────────────────────────────────────────────────
-import os
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.getcwd(), ".env"))
-GCP_CREDENTIALS_PATH = os.getenv("GCP_CREDENTIALS_PATH")
-GCP_PROJECT_ID       = os.getenv("GCP_PROJECT_ID")
-
-
-# ── Fetch / checkpoint settings ───────────────────────────────────────────────
-FETCH_DELAY_SECONDS = 0.5    # polite pause between BigQuery calls
-LLM_MAX_RETRIES   = 3
-LLM_RETRY_DELAY   = 2      # seconds between retries
-LLM_POLL_INTERVAL = 15     # seconds between model-detection polls
-LLM_CHUNK_SIZE    = 500     # number of articles sent per LLM API call
-LLM_WORKERS       = 5      # parallel LLM calls (set to CPU cores or less)
+SIM_MODEL = "gemma3_12"
 
 # ── Price / feature engineering ───────────────────────────────────────────────
-TARGET_HORIZON_DAYS = 1      # n-day forward return for binary target
-LOOKBACK_DAYS       = 80     # warm-up days downloaded before DATE_FROM (needs ~55 trading days for ma_50)
-ROLLING_WINDOW      = 30     # long-term sentiment baseline window
-NEUTRAL_MULTIPLIER  = 0.02   # near-neutral article filter (× rolling std)
+TARGET_HORIZON_DAYS = 1
+LOOKBACK_DAYS       = 80
+ROLLING_WINDOW      = 30
 
 # ── Train / val / test split ──────────────────────────────────────────────────
-VALIDATION_SPLIT = 0.20      # fraction of pre-test data held for validation
+VALIDATION_SPLIT = 0.20
+TEST_CUTOFF_DATE = "2026-02-01"
 
-# ── XGBoost grid search ───────────────────────────────────────────────────────
+# ── XGBoost ───────────────────────────────────────────────────────────────────
 XGB_FEATURES = [
-    "avg_score", "momentum", "std", "shock", "volume", "surprise_10", "accel",
+    "avg_score", "momentum", "momentum_10", "std", "shock",
+    "volume", "accel", "rsi", "vix", "volatility_20d",
+    "spx_return", "price_momentum_5d",
 ]
 TARGET_COL          = "target"
-DECISION_THRESHOLD  = 0.5    # set to "X" to enable auto-threshold search
-THRESHOLD_DEAD_ZONE = (0.0, 0.0)  # predictions in (low, high) are abstained
-SELECTION_METRIC    = "precision"  # accuracy | precision | recall | f1 | roc_auc
-SCALE_POS_WEIGHT    = False  # True → compensate for class imbalance
+DECISION_THRESHOLD  = 0.5
+THRESHOLD_DEAD_ZONE = (0.0, 0.0)
+SELECTION_METRIC    = "precision"
+SCALE_POS_WEIGHT    = True
 
 XGB_PARAM_GRID = {
-    "n_estimators":      [100, 150],
-    "max_depth":         [2, 3, 4],
-    "min_child_weight":  [3, 5, 7],
-    "learning_rate":     [0.01, 0.03, 0.05],
-    "subsample":         [0.5, 0.7],
-    "colsample_bytree":  [0.5, 0.6],
-    "colsample_bylevel": [0.5, 0.7],
-    "gamma":             [0.3, 1.0],
-    "reg_alpha":         [0.4, 2.0],
-    "reg_lambda":        [4, 10],
+    "n_estimators":     [100, 200, 300],
+    "max_depth":        [2, 3],
+    "min_child_weight": [5, 10, 20],
+    "learning_rate":    [0.01, 0.05],
+    "subsample":        [0.5, 0.6],
+    "colsample_bytree": [0.4, 0.6],
+    "gamma":            [1.0, 3.0],
+    "reg_alpha":        [1.0, 5.0],
+    "reg_lambda":       [5.0, 15.0],
 }
 
+# ── Walk-forward validation ───────────────────────────────────────────────────
+WF_TRAIN_WINDOW = 150
+WF_STEP         = 20
+
 # ── Trading simulation ────────────────────────────────────────────────────────
-LONG_THRESHOLD  = 0.55
-SHORT_THRESHOLD = 0.45
+LONG_THRESHOLD  = 0.500001
+SHORT_THRESHOLD = 0.499999
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SESSION_LOG_DIR = r"D:\PRODStockNews\session_logs"   # checkpoints, parquets, frozen models
+SESSION_LOG_DIR = r"D:\PRODStockNews\session_logs"
 BACKUP_ROOT     = r"D:\PRODStockNews\backup"
-
 ```
 
 ---
 
-
 ## Features
-
-Two categories of features are built and then joined on date before training.
 
 ### Sentiment features (per model)
 
-One set of the following columns is produced for each active sentiment model (e.g. `bert_avg`, `vader_avg`, `gemma3_avg`, …). In the model DataFrames fed to XGBoost the prefix is stripped and replaced with generic names (`avg_score`, `std`, etc.) so the same `XGB_FEATURES` list applies to every model.
-
 | Column suffix | Description |
 |---|---|
-| `_avg` | Daily mean sentiment score across all headlines |
-| `_std` | Daily standard deviation of sentiment scores |
+| `_avg` | Daily mean sentiment score |
+| `_std` | Daily standard deviation of scores |
 | `_count` | Number of headlines scored that day |
-| `_long_term` | Rolling mean of `_avg` over `ROLLING_WINDOW` days (default 30) — the baseline |
-| `_shock` | Z-score of today's `_avg` relative to the long-term baseline: `(avg − long_term) / std` |
+| `_long_term` | Rolling mean of `_avg` over `ROLLING_WINDOW` days |
+| `_shock` | Z-score of today's `_avg` vs the long-term baseline |
 | `_volume` | Sentiment-weighted article volume: `avg × √count` |
-| `_5d_avg` | 5-day rolling mean of `_avg` |
 | `_momentum` | Short-term momentum: `avg − 5d_avg` |
-| `_10d_avg` | 10-day rolling mean of `_avg` |
 | `_momentum_10` | Medium-term momentum: `avg − 10d_avg` |
-| `_surprise_5` | Same as `_momentum` (deviation from 5-day average) |
-| `_surprise_10` | Same as `_momentum_10` (deviation from 10-day average) |
 | `_accel` | Second difference of `_avg` — rate of change of momentum |
-| `_extreme` | Binary flag: 1 if `|avg| > 0.5`, indicating an unusually strong sentiment day |
-| `_flip` | Binary flag: 1 if sentiment direction reversed vs. the previous day |
+| `_extreme` | Binary flag: 1 if `\|avg\| > 0.5` |
+| `_flip` | Binary flag: 1 if sentiment direction reversed vs previous day |
+| `model_disagreement` | Std dev of `_avg` across all active models |
 
-A single cross-model feature is also added:
-
-| Column | Description |
-|---|---|
-| `model_disagreement` | Standard deviation of `_avg` across all active models on a given day — high values indicate models disagree on tone |
-
-### Price & market features (shared across all models)
+### Price & market features
 
 | Column | Description |
 |---|---|
 | `rsi` | 14-day Relative Strength Index |
-| `momentum_5d` | 5-day price return (Close pct change over 5 days) |
-| `momentum_20d` | 20-day price return |
-| `ma_20` | 20-day simple moving average of Close |
-| `ma_50` | 50-day simple moving average of Close |
-| `volume_change` | Day-over-day percentage change in trading volume |
+| `price_momentum_5d` | 5-day price return |
+| `price_momentum_20d` | 20-day price return |
 | `volatility_20d` | 20-day rolling standard deviation of daily returns |
-| `vix` | CBOE Volatility Index (^VIX) close, merged by date |
-
-### Default XGBoost feature set
-
-The features actually passed to the classifier are controlled by `XGB_FEATURES` in the config cell. The default selection is:
-
-```python
-XGB_FEATURES = [
-    "avg_score", "momentum", "std", "shock", "volume", "surprise_10", "accel",
-]
-```
-
-All remaining engineered columns (price features, `_extreme`, `_flip`, `model_disagreement`, etc.) are available in the merged DataFrames and can be added to `XGB_FEATURES` without any other code changes.
+| `ma_20` / `ma_50` | 20- and 50-day simple moving averages |
+| `volume_change` | Day-over-day % change in trading volume |
+| `vix` | CBOE Volatility Index close |
+| `spx_return` | S&P 500 daily return |
+| `spx_momentum_5` | S&P 500 5-day momentum |
+| `is_trading_day` | Boolean flag — False on weekends and holidays |
 
 ---
 
+## Validation approach
 
+| Layer | Purpose | Bias |
+|---|---|---|
+| **Static val set** | Param selection during grid search | Optimistic — used to pick the winner |
+| **Walk-forward** | Rolling out-of-sample estimate across 9+ windows | Primary metric — harder to game |
+| **Holdout test** | Final score on untouched data, looked at once | Ground truth |
+
+---
+
+## Results (v0.1 — Apr 2025 to Apr 2026)
+
+### Dataset
+
+| | |
+|---|---|
+| Total headlines | 34,890 |
+| Days with coverage | 349 |
+| Train rows (per model) | 220 |
+| Val rows | 56 |
+| Holdout rows | 73 |
+| Walk-forward folds | 9 (window=150, step=20) |
+
+### Model comparison
+
+| Model | Val AUC | WF AUC | Holdout AUC |
+|---|---|---|---|
+| BERT | 0.746 | 0.522 | 0.504 |
+| VADER | 0.526 | 0.518 | 0.479 |
+| TONE | 0.713 | 0.573 | 0.504 |
+| GEMMA3_4 | 0.756 | 0.528 | 0.494 |
+| **GEMMA3_12** | **0.789** | **0.603** | 0.447 |
+
+### Validation diagnostics
+
+![Validation Diagnostics](evaluations/validation.png)
+
+Each row is one sentiment model. Panels: confusion matrix, ROC curve, predicted probability distribution coloured by actual outcome (red = down day, blue = up day), feature importance. GEMMA3_12 shows the strongest ROC (AUC 0.789) and clearest probability separation. VADER, and GEMMA3_4 are predominantly collapsed near 0.5.
+
+### Walk-forward diagnostics
+
+![Walk-Forward Diagnostics](evaluations/walkthrough.png)
+
+Same layout computed across 9 rolling folds. GEMMA3_12 achieves the best walk-forward AUC (0.603) and is the only model showing meaningful probability spread between up and down days. Feature importance is averaged across all fold models — `price_momentum_5d`, `spx_return`, and `momentum` dominate across most models.
+
+### Holdout test diagnostics
+
+![Holdout Diagnostics](evaluations/holdouttest.png)
+
+Final evaluation on the Feb–Apr 2026 test period. All models show AUC near 0.5. The Gemma models show inverted probability distributions. Question remains if more/cleaner data will bring signal in testing, or if it is a fundamental model failure.
+
+---
 
 ## Output files
-
-All intermediate and final artefacts are written to `SESSION_LOG_DIR`:
 
 | File | Contents |
 |---|---|
 | `checkpoints_<TICKER>/<TICKER>_<date>.parquet` | Per-day raw headline cache |
 | `df_sentiments_final.parquet` | All scored headlines |
 | `xgb_<model>_frozen.pkl` | Trained and frozen XGBoost models |
-| `backup_<timestamp>_<top_model>/` | Full session snapshot (DataFrames + models + summary) |
+| `xgb_best_thresholds.pkl` | Best thresholds per model |
+| `backup_<timestamp>_<top_model>/` | Full session snapshot |
 
 ---
-
-
-
-## Visualizations
-
-### Model diagnostic grid
-
-Produced for each sentiment model on both the validation and test splits by `plot_model_diagnostics()`. Each model gets a row of four panels:
-
-- **Confusion matrix** — predicted Up/Down vs actual, rendered as a heatmap
-- **ROC curve** — with AUC score labelled; falls back to a text notice if only one class is present after dead-zone filtering
-- **Probability distribution** — histogram of predicted probabilities, coloured by actual class, showing how well the model separates Up from Down
-- **Feature importance** — horizontal bar chart of the top 12 XGBoost feature importances for that model
-
-All five sentiment models are stacked vertically in a single figure (one row per model), making it easy to compare signal quality across FinBERT, VADER, V2Tone, and any LLMs at a glance.
-
-### Trading simulation chart
-
-Produced by `plot_trading_simulation()` after the simulation runs on the test set. A single time-series line chart with four series plotted over the test period:
-
-| Series | Colour | Description |
-|---|---|---|
-| Long only | Green | Go long when predicted probability ≥ `LONG_THRESHOLD` |
-| Short only | Red | Go short when predicted probability ≤ `SHORT_THRESHOLD` |
-| Long/Short | Blue | Combine both signals |
-| Market | Gray (dashed) | Buy-and-hold benchmark |
-
-The y-axis is cumulative return (starting at 1.0). The model used for simulation is set via `SIM_MODEL` in the config cell.
-
-### Metrics summary table
-
-Printed to the notebook output after evaluation, listing accuracy, precision, recall, and F1 for each model on the validation and holdout test splits. This is a text/DataFrame table rather than a chart, but provides a quick numeric comparison alongside the visual diagnostics.
-
----
-
 
 ## Resuming a session
 
-The notebook writes a Parquet checkpoint for each calendar day it fetches. On subsequent runs it skips any day already cached, so interrupted runs can be restarted without re-querying BigQuery.
-
-To restore a previous session entirely:
-
 ```python
-restore_session(r"D:\PRODStockNews\backup\backup_20260415_1801__BERT_100")
+restore_session(r"D:\PRODStockNews\backup\backup_20260417_2207__BERT_73")
 ```
+
+---
+
+## Key findings (v0.2)
+
+- Need more data and clearer headlines to make any real findings.
+- All models show AUC near 0.5 on holdout 
+- **gemma3_12** is the strongest model on walk-forward with an AUC of 0.603, widest probability spread (0.30–0.65 range), tone also showing some promise.
+- BERT and VADER probabilities collapse to ~0.499–0.501 — no meaningful discrimination
+- TONE has the most balanced holdout performance despite weak walk-forward
+- Primary limitation: ~300 usable training rows is insufficient for stable generalisation
+
+## Next steps
+
+- Extend date range to 2022–present (~1500 days) for multi-regime training
+- **TF-IDF + NMF topic modeling** — compare topic distributions between up-day and down-day article corpora, weight articles by topic signal score before sentiment aggregation
+- Possibly batch LLM prompting to reduce the ~6 hour per-year scoring time, evaluate batch vs single performance.
 
 ---
 
 ## Notes
 
-- FinBERT requires a CUDA-capable GPU for reasonable throughput on large date ranges; it will fall back to CPU if no GPU is detected.
-- Ollama must be running locally before the Gemma scoring cells execute. The notebook polls until it becomes reachable and pulls model weights automatically if they are not already present.
-- VADER and V2Tone scoring are CPU-only and complete quickly relative to the transformer-based models.
-- The dead zone (`THRESHOLD_DEAD_ZONE`) can be widened to force the classifier to abstain on low-confidence predictions, which typically improves precision at the cost of coverage.
+- FinBERT requires a CUDA-capable GPU; falls back to CPU if none detected
+- Ollama must be running locally before LLM scoring cells execute
+- VADER and V2Tone scoring are CPU-only and fast relative to transformer-based models
+- `SCALE_POS_WEIGHT = True` is recommended — make sure to use threshold of .5 when true. 
